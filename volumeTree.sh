@@ -6,7 +6,6 @@ set -eo pipefail
 # ==============================================================================
 declare -A BLK_CHILDREN
 declare -A BLK_TYPE
-declare -A BLK_NAME
 declare -A BLK_FULLPATH
 declare -A SEEN_KNAME
 declare -A HAS_PARENT
@@ -29,17 +28,16 @@ MOUNTINFO="/proc/self/mountinfo"
 # 2. GATHER BLOCK DEVICES (lsblk)
 # ==============================================================================
 gather_block_devices() {
-    local line KNAME PKNAME TYPE NAME FSTYPE LABEL UUID unsorted_roots k
+    local line KNAME PKNAME TYPE FSTYPE LABEL UUID unsorted_roots k
 
     # Read tree of block devices safely using pairs
     while read -r line; do
         [[ -z "$line" ]] && continue
         
-        KNAME="" PKNAME="" TYPE="" NAME="" FSTYPE="" LABEL="" UUID=""
+        KNAME="" PKNAME="" TYPE="" FSTYPE="" LABEL="" UUID=""
         [[ $line =~ KNAME=\"([^\"]*)\" ]] && KNAME="${BASH_REMATCH[1]}"
         [[ $line =~ PKNAME=\"([^\"]*)\" ]] && PKNAME="${BASH_REMATCH[1]}"
         [[ $line =~ TYPE=\"([^\"]*)\" ]] && TYPE="${BASH_REMATCH[1]}"
-        [[ $line =~ NAME=\"([^\"]*)\" ]] && NAME="${BASH_REMATCH[1]}"
         [[ $line =~ FSTYPE=\"([^\"]*)\" ]] && FSTYPE="${BASH_REMATCH[1]}"
         [[ $line =~ LABEL=\"([^\"]*)\" ]] && LABEL="${BASH_REMATCH[1]}"
         [[ $line =~ UUID=\"([^\"]*)\" ]] && UUID="${BASH_REMATCH[1]}"
@@ -48,7 +46,8 @@ gather_block_devices() {
         
         # 1. Map parent-child graphs cleanly
         if [[ -n "$PKNAME" ]]; then
-            if [[ ! " ${BLK_CHILDREN[$PKNAME]} " =~ " $KNAME " ]]; then
+            # SC2076 fix: use standard string globbing instead of regex
+            if [[ ! " ${BLK_CHILDREN[$PKNAME]} " == *" $KNAME "* ]]; then
                 BLK_CHILDREN["$PKNAME"]+="$KNAME "
             fi
             HAS_PARENT["$KNAME"]=1
@@ -58,7 +57,6 @@ gather_block_devices() {
         if [[ -z "${SEEN_KNAME[$KNAME]}" ]]; then
             SEEN_KNAME["$KNAME"]=1
             BLK_TYPE["$KNAME"]="$TYPE"
-            BLK_NAME["$KNAME"]="$NAME"
             
             # Generate a Filesystem ID for RAID deduplication
             local fs_id=""
@@ -78,7 +76,7 @@ gather_block_devices() {
                 ZFS_POOL_TO_BLK["$LABEL"]="$KNAME"
             fi
         fi
-    done < <(lsblk -n --pairs -o KNAME,PKNAME,TYPE,NAME,FSTYPE,LABEL,UUID 2>/dev/null || true)
+    done < <(lsblk -n --pairs -o KNAME,PKNAME,TYPE,FSTYPE,LABEL,UUID 2>/dev/null || true)
 
     # 3. Establish root drives, sorted alphanumerically
     unsorted_roots=()
@@ -144,8 +142,9 @@ refine_device_identities() {
 # 4. GATHER MOUNT POINTS
 # ==============================================================================
 gather_mounts() {
-    local line parts major_minor root target sep_idx i fstype source
+    local line major_minor root target sep_idx i fstype source
     local super_options mount_type subvol_val norm_subvol norm_root entry kname pool_name
+    local -a parts
 
     if [[ ! -f "$MOUNTINFO" ]]; then
         echo "Error: $MOUNTINFO not found." >&2
@@ -155,7 +154,8 @@ gather_mounts() {
     while read -r line; do
         [[ -z "$line" ]] && continue
         
-        parts=($line)
+        # SC2206 fix: robust splitting
+        read -ra parts <<< "$line"
         major_minor="${parts[2]}"
         root="${parts[3]}"
         target="${parts[4]}"
@@ -240,10 +240,13 @@ gather_mounts() {
 # ==============================================================================
 get_filtered_children() {
     local kname="$1"
-    local raw_childs=(${BLK_CHILDREN[$kname]})
     local result=()
-    local c sc r unique keep_lvm sub_children
+    local c sc r unique keep_lvm
+    local -a raw_childs sub_children
     local -A seen_local
+
+    # SC2206 fix: robust splitting
+    read -ra raw_childs <<< "${BLK_CHILDREN[$kname]}"
 
     for c in "${raw_childs[@]}"; do
         [[ -z "$c" ]] && continue
@@ -264,7 +267,8 @@ get_filtered_children() {
             if [[ $keep_lvm -eq 1 ]]; then
                 result+=("$c")
             else
-                sub_children=($(get_filtered_children "$c"))
+                # SC2207 fix: robust splitting of command output
+                read -ra sub_children <<< "$(get_filtered_children "$c")"
                 for sc in "${sub_children[@]}"; do
                     [[ -n "$sc" ]] && result+=("$sc")
                 done
@@ -292,8 +296,8 @@ print_mounts() {
     local is_last_blk="$3"
     
     local entries valid_entries e count primary_idx best_score i
-    local target mroot fstype mtype msource score
-    local p_target p_root p_fstype p_mtype p_source
+    local target mroot fstype mtype score
+    local p_target p_fstype
     local ptr sec_prefix sec_count s sec_ptr resolved_root
 
     mapfile -t entries <<< "$list"
@@ -308,7 +312,8 @@ print_mounts() {
     primary_idx=0
     best_score=999999
     for (( i=0; i<count; i++ )); do
-        IFS="|" read -r target mroot fstype mtype msource <<< "${valid_entries[$i]}"
+        # Extract mroot and ignore others
+        IFS="|" read -r _ mroot _ _ _ <<< "${valid_entries[$i]}"
         score=${#mroot}
         [[ "$mroot" == "/" ]] && score=0
         if [[ $score -lt $best_score ]]; then
@@ -317,7 +322,8 @@ print_mounts() {
         fi
     done
 
-    IFS="|" read -r p_target p_root p_fstype p_mtype p_source <<< "${valid_entries[$primary_idx]}"
+    # SC2034 fix: replace unused variables with _
+    IFS="|" read -r p_target _ p_fstype _ _ <<< "${valid_entries[$primary_idx]}"
 
     ptr="├── "
     [[ "$is_last_blk" -eq 1 ]] && ptr="└── "
@@ -331,7 +337,8 @@ print_mounts() {
     for (( i=0; i<count; i++ )); do
         [[ $i -eq $primary_idx ]] && continue
         
-        IFS="|" read -r target mroot fstype mtype msource <<< "${valid_entries[$i]}"
+        # SC2034 fix: replace unused fstype and msource with _
+        IFS="|" read -r target mroot _ mtype _ <<< "${valid_entries[$i]}"
         
         sec_ptr="├── "
         [[ $s -eq $((sec_count - 1)) ]] && sec_ptr="└── "
@@ -353,7 +360,8 @@ print_blk_tree() {
     local prefix="$2"
     local is_last="$3"
     
-    local ptr b_type display_name child_prefix children mounts child_count has_mounts mounts_last c child_last fs_id
+    local ptr b_type display_name child_prefix mounts child_count has_mounts mounts_last c child_last fs_id
+    local -a children
 
     ptr="├── "
     [[ "$is_last" -eq 1 ]] && ptr="└── "
@@ -385,7 +393,8 @@ print_blk_tree() {
         mounts="${MNT_BY_BLK[$kname]}"
     fi
 
-    children=($(get_filtered_children "$kname"))
+    # SC2207 fix: robust array loading
+    read -ra children <<< "$(get_filtered_children "$kname")"
     
     child_count=${#children[@]}
     has_mounts=0
@@ -408,7 +417,7 @@ print_blk_tree() {
 # 7. MAIN EXECUTION
 # ==============================================================================
 main() {
-    local r is_last pool count i target mroot fstype mtype msource ptr
+    local r is_last pool count i target mroot fstype ptr
 
     if [[ $EUID -ne 0 ]]; then
         echo "[!] Warning: Running as non-root. Some block structures or labels may be hidden." >&2
@@ -441,7 +450,8 @@ main() {
         
         count=${#sorted_virtuals[@]}
         for (( i=0; i<count; i++ )); do
-            IFS="|" read -r target mroot fstype mtype msource <<< "${sorted_virtuals[$i]}"
+            # SC2034 fix: ignore unused mtype and msource
+            IFS="|" read -r target mroot fstype _ _ <<< "${sorted_virtuals[$i]}"
             
             ptr="├── "
             [[ $i -eq $((count - 1)) ]] && ptr="└── "
